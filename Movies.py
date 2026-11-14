@@ -1,12 +1,3 @@
-YTS Movies Pro Telegram Bot (yts.gg/api/v2)
-===========================================
-A high-performance, asynchronous Telegram bot powered by the YTS API (v2)
-with fallback mirror support, rich inline keyboards, Magnet & .torrent links,
-poster previews, IMDb ratings, and automated new-release alerts.
-
-Designed to run continuously on GitHub Actions or any Python environment.
-"""
-
 import os
 import time
 import json
@@ -35,15 +26,10 @@ from telegram.ext import (
     filters,
 )
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WATCHED_MOVIES_ENV = os.getenv("WATCHED_MOVIES", "")
 IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-
-# Run for ~5 hours 45 minutes per GitHub Actions job before clean exit & auto-restart
 GITHUB_SESSION_MAX_SECONDS = int(os.getenv("GITHUB_SESSION_SECONDS", "20700"))
 
 YTS_API_MIRRORS = [
@@ -73,12 +59,7 @@ logging.basicConfig(
 logger = logging.getLogger("YTSProBot")
 
 
-# ==============================================================================
-# YTS API ASYNC CLIENT (WITH AUTOMATIC MIRROR FAILOVER)
-# ==============================================================================
 class YTSClient:
-    """Asynchronous client for YTS API v2 with automatic mirror fallback."""
-
     def __init__(self, mirrors: List[str]):
         self.mirrors = mirrors
         self.headers = {
@@ -131,7 +112,6 @@ class YTSClient:
         return data.get("movies", []) or []
 
     async def smart_search(self, raw_query: str, limit: int = 12) -> List[Dict[str, Any]]:
-        """Multi-pass intelligent search across seeds & download counts with year/symbol cleanup."""
         cleaned = " ".join(raw_query.strip().split())
         if not cleaned:
             return []
@@ -195,9 +175,6 @@ class YTSClient:
 yts = YTSClient(YTS_API_MIRRORS)
 
 
-# ==============================================================================
-# LOCAL PERSISTENCE HELPERS
-# ==============================================================================
 def load_json_file(path: str, default: Any) -> Any:
     if os.path.exists(path):
         try:
@@ -213,9 +190,6 @@ def save_json_file(path: str, data: Any) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-# ==============================================================================
-# UI FORMATTERS & KEYBOARD BUILDERS
-# ==============================================================================
 def format_movie_card(movie: Dict[str, Any]) -> str:
     title = movie.get("title_long") or f"{movie.get('title')} ({movie.get('year')})"
     rating = movie.get("rating", "N/A")
@@ -315,9 +289,6 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-# ==============================================================================
-# TELEGRAM BOT HANDLERS
-# ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_text = (
         "🎬 **أهلاً بك في بوت YTS Movies Pro!** 🍿\n\n"
@@ -601,9 +572,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
 
 
-# ==============================================================================
-# BACKGROUND MONITOR
-# ==============================================================================
 async def check_new_releases_and_notify(bot: Bot) -> None:
     state: Dict[str, bool] = load_json_file(STATE_FILE, {})
     state_changed = False
@@ -656,7 +624,6 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def run_github_actions_runner() -> None:
-    
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
