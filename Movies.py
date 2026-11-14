@@ -656,11 +656,7 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def run_github_actions_runner() -> None:
-    """
-    Runs the full interactive Telegram bot inside GitHub Actions for up to
-    ~5h45m per workflow run, then gracefully shuts down so the next scheduled
-    run picks up seamlessly without losing messages.
-    """
+    
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
