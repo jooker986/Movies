@@ -1,0 +1,33 @@
+name: YTS Movies Pro Auto-Monitor
+​on:
+schedule:
+# يفحص الموقع تلقائياً كل 15 دقيقة
+- cron: "*/15 * * * *"
+workflow_dispatch: # للتشغيل اليدوي الفوري في أي وقت
+​jobs:
+monitor-yts:
+runs-on: ubuntu-latest
+​steps:
+- name: Checkout repository
+uses: actions/checkout@v4
+​- name: Set up Python 3.11
+uses: actions/setup-python@v5
+with:
+python-version: "3.11"
+​- name: Restore YTS notification state cache
+uses: actions/cache@v4
+with:
+path: yts_notified_state.json
+key: yts-notified-state-${{ github.run_id }}
+restore-keys: |
+yts-notified-state-
+​- name: Install dependencies
+run: |
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+​- name: Run YTS Movies Monitor
+env:
+TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+WATCHED_MOVIES: ${{ secrets.WATCHED_MOVIES }}
+run: python Movies.py
