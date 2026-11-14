@@ -1,7 +1,7 @@
+
 import os
-import re
-import html
 import json
+import html
 import logging
 import sqlite3
 from pathlib import Path
@@ -9,11 +9,8 @@ from contextlib import contextmanager
 from urllib.parse import quote
 
 import aiohttp
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -24,33 +21,36 @@ from telegram.ext import (
     filters,
 )
 
-# =========================================================
-# CONFIG
-# =========================================================
+# =====================================================
+# SETTINGS
+# =====================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-
-# ضع Telegram User ID الخاص بك في GitHub Secrets باسم ADMIN_ID
 ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 
-YTS_API = "https://yts.mx/api/v2"
+# API الأساسي + عناوين احتياطية
+API_BASES = [
+    "https://movies-api.accel.li/api/v2",
+    "https://yts.gg/api/v2",
+    "https://yts.mx/api/v2",
+]
 
 DB_PATH = Path(os.getenv("DB_PATH", "yts_movies.db"))
 
-CHECK_INTERVAL = 600  # فحص الأفلام الجديدة كل 10 دقائق
 MOVIES_PER_PAGE = 5
+CHECK_INTERVAL = 600  # كل 10 دقائق
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-logger = logging.getLogger("YTS-Movies-Pro")
+logger = logging.getLogger("YTS-BOT")
 
 
-# =========================================================
+# =====================================================
 # DATABASE
-# =========================================================
+# =====================================================
 
 class Database:
 
@@ -61,27 +61,22 @@ class Database:
 
     @contextmanager
     def connect(self):
-        connection = sqlite3.connect(
-            str(self.path),
-            timeout=30,
-        )
-
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=30000")
+        conn = sqlite3.connect(str(self.path), timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
 
         try:
-            yield connection
-            connection.commit()
+            yield conn
+            conn.commit()
         except Exception:
-            connection.rollback()
+            conn.rollback()
             raise
         finally:
-            connection.close()
+            conn.close()
 
     def initialize(self):
-        with self.connect() as db:
-            db.executescript("""
+        with self.connect() as conn:
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,
                     username TEXT DEFAULT '',
@@ -108,157 +103,192 @@ class Database:
                 );
             """)
 
-    # تسجيل المستخدم بدون تكرار
     def register_user(self, user_id, username=""):
-        with self.connect() as db:
-            db.execute("""
+        with self.connect() as conn:
+            conn.execute("""
                 INSERT INTO users (user_id, username)
                 VALUES (?, ?)
                 ON CONFLICT(user_id)
                 DO UPDATE SET username = excluded.username
             """, (str(user_id), username or ""))
 
-    # عدد المستخدمين
     def get_user_count(self):
-        with self.connect() as db:
-            result = db.execute(
+        with self.connect() as conn:
+            return conn.execute(
                 "SELECT COUNT(*) FROM users"
-            ).fetchone()
+            ).fetchone()[0]
 
-            return result[0]
-
-    # جميع المستخدمين
     def get_all_users(self):
-        with self.connect() as db:
-            rows = db.execute(
+        with self.connect() as conn:
+            rows = conn.execute(
                 "SELECT user_id FROM users"
             ).fetchall()
 
             return [row["user_id"] for row in rows]
 
-    # إضافة أو حذف من المفضلة
-    def toggle_favorite(self, user_id, movie_id, title):
-        with self.connect() as db:
+    def toggle_item(self, table, user_id, movie_id, title):
+        if table not in ("favorites", "watchlist"):
+            return False
 
-            existing = db.execute("""
-                SELECT 1 FROM favorites
-                WHERE user_id = ? AND movie_id = ?
-            """, (str(user_id), movie_id)).fetchone()
-
-            if existing:
-                db.execute("""
-                    DELETE FROM favorites
-                    WHERE user_id = ? AND movie_id = ?
-                """, (str(user_id), movie_id))
-
-                return False
-
-            db.execute("""
-                INSERT OR IGNORE INTO favorites
-                (user_id, movie_id, title)
-                VALUES (?, ?, ?)
-            """, (str(user_id), movie_id, title))
-
-            return True
-
-    def get_favorites(self, user_id):
-        with self.connect() as db:
-            return db.execute("""
-                SELECT movie_id, title
-                FROM favorites
-                WHERE user_id = ?
-                ORDER BY title
-            """, (str(user_id),)).fetchall()
-
-    # إضافة أو حذف من قائمة المتابعة
-    def toggle_watchlist(self, user_id, movie_id, title):
-        with self.connect() as db:
-
-            existing = db.execute("""
-                SELECT 1 FROM watchlist
-                WHERE user_id = ? AND movie_id = ?
-            """, (str(user_id), movie_id)).fetchone()
+        with self.connect() as conn:
+            existing = conn.execute(
+                f"SELECT 1 FROM {table} WHERE user_id=? AND movie_id=?",
+                (str(user_id), int(movie_id)),
+            ).fetchone()
 
             if existing:
-                db.execute("""
-                    DELETE FROM watchlist
-                    WHERE user_id = ? AND movie_id = ?
-                """, (str(user_id), movie_id))
-
+                conn.execute(
+                    f"DELETE FROM {table} WHERE user_id=? AND movie_id=?",
+                    (str(user_id), int(movie_id)),
+                )
                 return False
 
-            db.execute("""
-                INSERT OR IGNORE INTO watchlist
-                (user_id, movie_id, title)
-                VALUES (?, ?, ?)
-            """, (str(user_id), movie_id, title))
-
+            conn.execute(
+                f"INSERT OR IGNORE INTO {table} (user_id, movie_id, title) VALUES (?, ?, ?)",
+                (str(user_id), int(movie_id), title),
+            )
             return True
 
-    def get_watchlist(self, user_id):
-        with self.connect() as db:
-            return db.execute("""
-                SELECT movie_id, title
-                FROM watchlist
-                WHERE user_id = ?
-                ORDER BY title
-            """, (str(user_id),)).fetchall()
+    def get_items(self, table, user_id):
+        if table not in ("favorites", "watchlist"):
+            return []
 
-    # حفظ آخر أفلام تم فحصها
+        with self.connect() as conn:
+            return conn.execute(
+                f"SELECT movie_id, title FROM {table} WHERE user_id=? ORDER BY title",
+                (str(user_id),),
+            ).fetchall()
+
     def get_setting(self, key):
-        with self.connect() as db:
-            row = db.execute("""
-                SELECT setting_value
-                FROM settings
-                WHERE setting_key = ?
-            """, (key,)).fetchone()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT setting_value FROM settings WHERE setting_key=?",
+                (key,),
+            ).fetchone()
 
             return row["setting_value"] if row else None
 
     def set_setting(self, key, value):
-        with self.connect() as db:
-            db.execute("""
+        with self.connect() as conn:
+            conn.execute("""
                 INSERT INTO settings (setting_key, setting_value)
                 VALUES (?, ?)
                 ON CONFLICT(setting_key)
-                DO UPDATE SET setting_value = excluded.setting_value
+                DO UPDATE SET setting_value=excluded.setting_value
             """, (key, value))
 
 
 db = Database(DB_PATH)
 
 
-# =========================================================
+# =====================================================
+# USER REGISTRATION
+# =====================================================
+
+def register_user(update):
+
+    user = update.effective_user
+
+    if user:
+        db.register_user(
+            str(user.id),
+            user.username or "",
+        )
+
+
+# =====================================================
 # YTS API
-# =========================================================
+# =====================================================
 
 async def yts_request(endpoint, params=None):
 
-    url = f"{YTS_API}/{endpoint}.json"
+    timeout = aiohttp.ClientTimeout(total=35)
 
-    timeout = aiohttp.ClientTimeout(total=25)
+    headers = {
+        "User-Agent": "Mozilla/5.0 YTSMoviesTelegramBot/3.0",
+        "Accept": "application/json",
+    }
+
+    last_error = "Unknown API error"
 
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                url,
-                params=params or {},
-            ) as response:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers=headers,
+        ) as session:
 
-                if response.status != 200:
-                    logger.error("YTS API returned %s", response.status)
-                    return None
+            for base in API_BASES:
 
-                data = await response.json(content_type=None)
+                url = f"{base}/{endpoint}.json"
 
-                if data.get("status") != "ok":
-                    return None
+                try:
+                    logger.info("API REQUEST: %s", url)
 
-                return data.get("data", {})
+                    async with session.get(
+                        url,
+                        params=params or {},
+                    ) as response:
 
-    except Exception:
-        logger.exception("YTS API request failed")
-        return None
+                        body = await response.text()
+
+                        logger.info(
+                            "API RESPONSE: HTTP %s",
+                            response.status,
+                        )
+
+                        if response.status != 200:
+                            last_error = (
+                                f"HTTP {response.status}: {body[:250]}"
+                            )
+                            logger.warning(
+                                "API failed on %s: %s",
+                                base,
+                                last_error,
+                            )
+                            continue
+
+                        try:
+                            result = json.loads(body)
+                        except json.JSONDecodeError:
+                            last_error = "Invalid JSON response"
+                            logger.warning(
+                                "Invalid JSON from %s",
+                                base,
+                            )
+                            continue
+
+                        if result.get("status") != "ok":
+                            last_error = result.get(
+                                "status_message",
+                                "API returned an error",
+                            )
+                            logger.warning(
+                                "API message from %s: %s",
+                                base,
+                                last_error,
+                            )
+                            continue
+
+                        logger.info("API SUCCESS: %s", base)
+                        return result.get("data") or {}
+
+                except Exception as error:
+                    last_error = str(error)
+                    logger.exception(
+                        "Connection failed: %s",
+                        base,
+                    )
+
+    except Exception as error:
+        last_error = str(error)
+        logger.exception("API session failed")
+
+    logger.error(
+        "ALL YTS API SOURCES FAILED. Last error: %s",
+        last_error,
+    )
+
+    return None
 
 
 async def get_movies(
@@ -266,11 +296,12 @@ async def get_movies(
     sort_by="date_added",
     genre=None,
     query=None,
+    limit=MOVIES_PER_PAGE,
 ):
 
     params = {
-        "limit": MOVIES_PER_PAGE,
-        "page": page,
+        "limit": max(1, min(int(limit), 50)),
+        "page": max(1, int(page)),
         "sort_by": sort_by,
         "order_by": "desc",
     }
@@ -283,8 +314,8 @@ async def get_movies(
 
     data = await yts_request("list_movies", params)
 
-    if not data:
-        return []
+    if data is None:
+        return None
 
     return data.get("movies") or []
 
@@ -306,62 +337,35 @@ async def get_movie_details(movie_id):
     return data.get("movie")
 
 
-async def get_similar_movies(movie_id):
-
-    data = await yts_request(
-        "movie_suggestions",
-        {"movie_id": movie_id},
-    )
-
-    if not data:
-        return []
-
-    return data.get("movies") or []
-
-
-# =========================================================
+# =====================================================
 # HELPERS
-# =========================================================
+# =====================================================
 
-def register_update_user(update):
-
-    user = update.effective_user
-
-    if user:
-        db.register_user(
-            str(user.id),
-            user.username or "",
-        )
-
-
-def safe_text(value):
+def safe(value):
     return html.escape(str(value or ""))
 
 
-def get_movie_title(movie):
+def movie_title(movie):
     return movie.get("title_long") or movie.get("title") or "Unknown"
 
 
-def get_magnet(movie, torrent):
+def magnet_link(movie, torrent):
 
-    info_hash = torrent.get("hash", "").strip()
+    info_hash = torrent.get("hash")
 
     if not info_hash:
         return None
 
-    title = get_movie_title(movie)
+    title = quote(movie_title(movie))
 
     trackers = [
-        "udp://open.demonii.com:1337/announce",
-        "udp://tracker.openbittorrent.com:80",
         "udp://tracker.opentrackr.org:1337/announce",
         "udp://tracker.torrent.eu.org:451/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://tracker.openbittorrent.com:80",
     ]
 
-    magnet = (
-        f"magnet:?xt=urn:btih:{info_hash}"
-        f"&dn={quote(title)}"
-    )
+    magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={title}"
 
     for tracker in trackers:
         magnet += f"&tr={quote(tracker, safe='')}"
@@ -369,54 +373,61 @@ def get_magnet(movie, torrent):
     return magnet
 
 
-def movie_keyboard(movie):
-
-    movie_id = movie.get("id")
-    title = get_movie_title(movie)
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🎬 التفاصيل",
-                callback_data=f"movie:{movie_id}",
-            ),
-            InlineKeyboardButton(
-                "⭐ المفضلة",
-                callback_data=f"fav:{movie_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🔔 قائمة المتابعة",
-                callback_data=f"watch:{movie_id}",
-            ),
-        ],
-    ])
-
-
 def movie_caption(movie):
 
-    title = safe_text(get_movie_title(movie))
+    title = safe(movie_title(movie))
     year = movie.get("year", "N/A")
     rating = movie.get("rating", "N/A")
     runtime = movie.get("runtime", "N/A")
 
     genres = movie.get("genres") or []
-    genres_text = ", ".join(genres[:4]) if genres else "غير محدد"
+    genres_text = ", ".join(genres[:4]) if genres else "Unknown"
 
-    summary = movie.get("summary") or movie.get("description_full") or ""
-    summary = safe_text(summary[:700])
+    summary = (
+        movie.get("summary")
+        or movie.get("description_full")
+        or "لا توجد قصة متاحة."
+    )
+
+    summary = safe(summary[:350])
 
     return (
         f"🎬 <b>{title}</b>\n\n"
         f"📅 السنة: {year}\n"
         f"⭐ التقييم: {rating}/10\n"
         f"⏱ المدة: {runtime} دقيقة\n"
-        f"🎭 التصنيف: {safe_text(genres_text)}\n\n"
-        f"📝 <b>القصة:</b>\n"
-        f"{summary or 'لا توجد قصة متاحة.'}"
+        f"🎭 التصنيف: {safe(genres_text)}\n\n"
+        f"📝 <b>القصة:</b>\n{summary}"
     )
 
+
+def movie_keyboard(movie):
+
+    movie_id = movie.get("id")
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🎬 التفاصيل والجودات",
+                callback_data=f"movie:{movie_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⭐ المفضلة",
+                callback_data=f"fav:{movie_id}",
+            ),
+            InlineKeyboardButton(
+                "🔔 متابعة",
+                callback_data=f"watch:{movie_id}",
+            ),
+        ],
+    ])
+
+
+# =====================================================
+# SEND MOVIE RESULTS
+# =====================================================
 
 async def send_movie_list(
     update,
@@ -426,40 +437,54 @@ async def send_movie_list(
     list_type="latest",
 ):
 
-    if not movies:
-        await update.effective_message.reply_text(
-            "❌ مفيش أفلام متاحة حاليًا."
+    message = update.effective_message
+
+    if movies is None:
+        await message.reply_text(
+            "⚠️ حصل خطأ أثناء الاتصال بمصدر الأفلام.\n"
+            "راجع سجل Actions لمعرفة تفاصيل الخطأ."
         )
         return
 
-    await update.effective_message.reply_text(
-        f"<b>{safe_text(title)}</b>\n"
+    if not movies:
+        await message.reply_text(
+            "🔎 مفيش نتائج أفلام للطلب ده."
+        )
+        return
+
+    await message.reply_text(
+        f"<b>{safe(title)}</b>\n"
         f"الصفحة: {page}",
         parse_mode=ParseMode.HTML,
     )
 
     for movie in movies:
 
-        poster = movie.get("medium_cover_image") or movie.get("large_cover_image")
-
         caption = movie_caption(movie)
+        poster = (
+            movie.get("medium_cover_image")
+            or movie.get("large_cover_image")
+        )
 
         keyboard = movie_keyboard(movie)
 
         if poster:
             try:
-                await update.effective_message.reply_photo(
+                await message.reply_photo(
                     photo=poster,
-                    caption=caption[:1024],
+                    caption=caption,
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard,
                 )
                 continue
             except Exception:
-                logger.warning("Could not send movie poster")
+                logger.exception(
+                    "Could not send poster for movie %s",
+                    movie.get("id"),
+                )
 
-        await update.effective_message.reply_text(
-            caption[:4000],
+        await message.reply_text(
+            caption,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
@@ -477,67 +502,83 @@ async def send_movie_list(
         ]
     ])
 
-    await update.effective_message.reply_text(
+    await message.reply_text(
         "تصفح صفحات الأفلام:",
         reply_markup=navigation,
     )
 
 
-# =========================================================
+# =====================================================
 # COMMANDS
-# =========================================================
+# =====================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    register_update_user(update)
+    register_user(update)
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🆕 أحدث الأفلام", callback_data="page:latest:1"),
-            InlineKeyboardButton("🔥 الأعلى تقييمًا", callback_data="page:top:1"),
+            InlineKeyboardButton(
+                "🆕 أحدث الأفلام",
+                callback_data="page:latest:1",
+            ),
+            InlineKeyboardButton(
+                "🔥 الأعلى تقييمًا",
+                callback_data="page:top:1",
+            ),
         ],
         [
-            InlineKeyboardButton("⭐ المفضلة", callback_data="myfavorites"),
-            InlineKeyboardButton("🔔 قائمة المتابعة", callback_data="mywatchlist"),
+            InlineKeyboardButton(
+                "⭐ المفضلة",
+                callback_data="myfavorites",
+            ),
+            InlineKeyboardButton(
+                "🔔 المتابعة",
+                callback_data="mywatchlist",
+            ),
         ],
         [
-            InlineKeyboardButton("🎭 التصنيفات", callback_data="categories"),
+            InlineKeyboardButton(
+                "🎭 التصنيفات",
+                callback_data="categories",
+            ),
         ],
     ])
 
     await update.message.reply_text(
-        "🎬 <b>أهلاً بك في YTS Movies Pro Ultra</b>\n\n"
-        "تقدر تبحث عن الأفلام وتشوف أحدث الإصدارات "
-        "وتضيف أفلامك للمفضلة وقائمة المتابعة.\n\n"
-        "🔎 ابعت اسم الفيلم للبحث عنه.\n\n"
-        "اكتب /help لعرض الأوامر.",
+        "🎬 <b>YTS Movies Pro Ultra</b>\n\n"
+        "أهلاً بيك!\n"
+        "ابعت اسم الفيلم للبحث عنه.\n\n"
+        "استخدم الأزرار للتصفح أو اكتب /help.",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update, context):
 
-    register_update_user(update)
+    register_user(update)
 
     await update.message.reply_text(
         "📚 <b>أوامر البوت</b>\n\n"
         "/start - تشغيل البوت\n"
         "/latest - أحدث الأفلام\n"
-        "/top - أعلى الأفلام تقييمًا\n"
-        "/favorites - أفلامك المفضلة\n"
+        "/top - الأعلى تقييمًا\n"
+        "/favorites - المفضلة\n"
         "/watchlist - قائمة المتابعة\n"
-        "/stats - إحصائيات المستخدمين (للأدمن فقط)\n\n"
-        "🔎 ابعت اسم أي فيلم للبحث عنه.",
+        "/categories - التصنيفات\n"
+        "/stats - إحصائيات الأدمن\n"
+        "/testapi - اختبار الاتصال بالـ API للأدمن\n\n"
+        "🔎 ابعت اسم الفيلم للبحث.",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def latest_command(update, context):
 
-    register_update_user(update)
+    register_user(update)
 
-    movies = await get_movies(page=1, sort_by="date_added")
+    movies = await get_movies(sort_by="date_added")
 
     await send_movie_list(
         update,
@@ -548,146 +589,126 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def top_command(update, context):
 
-    register_update_user(update)
+    register_user(update)
 
-    movies = await get_movies(page=1, sort_by="rating")
+    movies = await get_movies(sort_by="rating")
 
     await send_movie_list(
         update,
         movies,
-        "🔥 أعلى الأفلام تقييمًا",
+        "🔥 الأعلى تقييمًا",
         1,
         "top",
     )
 
 
-# =========================================================
-# USER STATISTICS - ADMIN ONLY
-# =========================================================
+async def stats_command(update, context):
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    register_update_user(update)
+    register_user(update)
 
     user = update.effective_user
 
     if not ADMIN_ID:
         await update.message.reply_text(
-            "⚠️ لم يتم ضبط ADMIN_ID في إعدادات البوت."
+            "⚠️ لم يتم ضبط ADMIN_ID في GitHub Secrets."
         )
         return
 
     if not user or str(user.id) != ADMIN_ID:
         await update.message.reply_text(
-            "⛔ الأمر ده متاح للأدمن فقط."
+            "⛔ الأمر متاح للأدمن فقط."
         )
         return
 
-    total_users = db.get_user_count()
+    total = db.get_user_count()
 
     await update.message.reply_text(
-        "📊 <b>إحصائيات YTS Movies Pro Ultra</b>\n\n"
-        f"👥 إجمالي المستخدمين: <b>{total_users}</b>\n"
+        "📊 <b>إحصائيات البوت</b>\n\n"
+        f"👥 إجمالي المستخدمين: <b>{total}</b>\n"
         "💾 قاعدة البيانات: SQLite\n"
-        f"🔔 فحص الأفلام كل: {CHECK_INTERVAL // 60} دقائق",
+        f"🔔 الفحص كل {CHECK_INTERVAL // 60} دقائق",
         parse_mode=ParseMode.HTML,
     )
 
 
-# =========================================================
-# SEARCH
-# =========================================================
+async def testapi_command(update, context):
 
-async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update)
 
-    register_update_user(update)
+    user = update.effective_user
 
-    query = (update.message.text or "").strip()
-
-    if not query or query.startswith("/"):
-        return
-
-    if len(query) < 2:
+    if not ADMIN_ID or not user or str(user.id) != ADMIN_ID:
         await update.message.reply_text(
-            "اكتب اسم فيلم أطول شوية للبحث."
+            "⛔ الأمر متاح للأدمن فقط."
         )
         return
 
     await update.message.reply_text(
-        f"🔎 جاري البحث عن: {safe_text(query)}",
-        parse_mode=ParseMode.HTML,
+        "🔄 جاري اختبار الاتصال بـ YTS API..."
     )
 
-    movies = await get_movies(
-        page=1,
-        sort_by="year",
-        query=query,
+    movies = await get_movies(limit=3)
+
+    if movies is None:
+        await update.message.reply_text(
+            "❌ فشل الاتصال بجميع مصادر API.\n"
+            "افتح Actions وشوف سجل الأخطاء."
+        )
+        return
+
+    await update.message.reply_text(
+        f"✅ الاتصال ناجح!\n"
+        f"🎬 عدد الأفلام المستلمة في الاختبار: {len(movies)}"
     )
 
-    await send_movie_list(
-        update,
-        movies,
-        f"نتائج البحث عن {query}",
-        1,
-        "latest",
-    )
 
+async def favorites_command(update, context):
 
-# =========================================================
-# FAVORITES AND WATCHLIST
-# =========================================================
+    register_user(update)
 
-async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    register_update_user(update)
-
-    rows = db.get_favorites(update.effective_user.id)
+    rows = db.get_items("favorites", update.effective_user.id)
 
     if not rows:
-        await update.message.reply_text(
-            "⭐ قائمة المفضلة فارغة."
-        )
+        await update.message.reply_text("⭐ المفضلة فارغة.")
         return
 
-    keyboard = []
-
-    for row in rows:
-        keyboard.append([
+    keyboard = [
+        [
             InlineKeyboardButton(
-                f"🎬 {row['title'][:45]}",
+                row["title"][:50],
                 callback_data=f"movie:{row['movie_id']}",
             )
-        ])
+        ]
+        for row in rows
+    ]
 
     await update.message.reply_text(
-        f"⭐ أفلامك المفضلة: {len(rows)}",
+        f"⭐ المفضلة: {len(rows)} فيلم",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def watchlist_command(update, context):
 
-    register_update_user(update)
+    register_user(update)
 
-    rows = db.get_watchlist(update.effective_user.id)
+    rows = db.get_items("watchlist", update.effective_user.id)
 
     if not rows:
-        await update.message.reply_text(
-            "🔔 قائمة المتابعة فارغة."
-        )
+        await update.message.reply_text("🔔 قائمة المتابعة فارغة.")
         return
 
-    keyboard = []
-
-    for row in rows:
-        keyboard.append([
+    keyboard = [
+        [
             InlineKeyboardButton(
-                f"🎬 {row['title'][:45]}",
+                row["title"][:50],
                 callback_data=f"movie:{row['movie_id']}",
             )
-        ])
+        ]
+        for row in rows
+    ]
 
     await update.message.reply_text(
         f"🔔 قائمة المتابعة: {len(rows)} فيلم",
@@ -695,9 +716,9 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =========================================================
+# =====================================================
 # CATEGORIES
-# =========================================================
+# =====================================================
 
 GENRES = [
     "Action",
@@ -705,30 +726,32 @@ GENRES = [
     "Animation",
     "Comedy",
     "Crime",
+    "Documentary",
     "Drama",
+    "Family",
     "Fantasy",
     "Horror",
     "Mystery",
     "Romance",
     "Sci-Fi",
     "Thriller",
-    "Documentary",
+    "War",
 ]
 
 
-async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def categories_command(update, context):
 
-    register_update_user(update)
+    register_user(update)
 
-    keyboard = []
-
-    for genre in GENRES:
-        keyboard.append([
+    keyboard = [
+        [
             InlineKeyboardButton(
                 genre,
                 callback_data=f"genre:{genre}",
             )
-        ])
+        ]
+        for genre in GENRES
+    ]
 
     await update.message.reply_text(
         "🎭 اختار تصنيف الأفلام:",
@@ -736,14 +759,54 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-# =========================================================
-# CALLBACK HANDLER
-# =========================================================
+# =====================================================
+# TEXT SEARCH
+# =====================================================
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_search(update, context):
+
+    register_user(update)
+
+    search_text = (update.message.text or "").strip()
+
+    if len(search_text) < 2:
+        await update.message.reply_text(
+            "اكتب اسم فيلم صحيح للبحث."
+        )
+        return
+
+    status = await update.message.reply_text(
+        f"🔎 جاري البحث عن: {safe(search_text)}",
+        parse_mode=ParseMode.HTML,
+    )
+
+    movies = await get_movies(
+        page=1,
+        sort_by="date_added",
+        query=search_text,
+    )
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    await send_movie_list(
+        update,
+        movies,
+        f"نتائج البحث: {search_text}",
+        1,
+        "latest",
+    )
+
+
+# =====================================================
+# CALLBACK HANDLER
+# =====================================================
+
+async def callback_handler(update, context):
 
     query = update.callback_query
-
     await query.answer()
 
     user = query.from_user
@@ -756,24 +819,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data or ""
 
-    # عرض أحدث الأفلام أو الأعلى تقييمًا
+    # Pagination
     if data.startswith("page:"):
 
-        _, list_type, page = data.split(":")
-        page = max(1, int(page))
+        try:
+            _, list_type, page = data.split(":")
+            page = max(1, int(page))
+        except ValueError:
+            return
 
-        sort_by = "rating" if list_type == "top" else "date_added"
+        sort_by = (
+            "rating"
+            if list_type == "top"
+            else "date_added"
+        )
 
         movies = await get_movies(
             page=page,
             sort_by=sort_by,
         )
-
-        if not movies:
-            await query.message.reply_text(
-                "❌ مفيش نتائج في الصفحة دي."
-            )
-            return
 
         await send_movie_list(
             update,
@@ -782,10 +846,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page,
             list_type,
         )
-
         return
 
-    # التصنيفات
+    # Categories menu
+    if data == "categories":
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    genre,
+                    callback_data=f"genre:{genre}",
+                )
+            ]
+            for genre in GENRES
+        ]
+
+        await query.message.reply_text(
+            "🎭 اختار تصنيف الأفلام:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    # Genre
     if data.startswith("genre:"):
 
         genre = data.split(":", 1)[1]
@@ -801,13 +883,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             movies,
             f"🎭 تصنيف {genre}",
         )
-
         return
 
-    # عرض المفضلة
+    # Favorites list
     if data == "myfavorites":
 
-        rows = db.get_favorites(user.id)
+        rows = db.get_items("favorites", user.id)
 
         if not rows:
             await query.message.reply_text("⭐ المفضلة فارغة.")
@@ -816,7 +897,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [
                 InlineKeyboardButton(
-                    row["title"][:45],
+                    row["title"][:50],
                     callback_data=f"movie:{row['movie_id']}",
                 )
             ]
@@ -827,13 +908,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⭐ أفلامك المفضلة:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-
         return
 
-    # عرض قائمة المتابعة
+    # Watchlist
     if data == "mywatchlist":
 
-        rows = db.get_watchlist(user.id)
+        rows = db.get_items("watchlist", user.id)
 
         if not rows:
             await query.message.reply_text("🔔 قائمة المتابعة فارغة.")
@@ -842,7 +922,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [
                 InlineKeyboardButton(
-                    row["title"][:45],
+                    row["title"][:50],
                     callback_data=f"movie:{row['movie_id']}",
                 )
             ]
@@ -853,14 +933,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔔 قائمة المتابعة:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-
         return
 
-    # إضافة أو إزالة من المفضلة
+    # Favorite toggle
     if data.startswith("fav:"):
 
         movie_id = int(data.split(":")[1])
-
         movie = await get_movie_details(movie_id)
 
         if not movie:
@@ -869,27 +947,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        added = db.toggle_favorite(
+        added = db.toggle_item(
+            "favorites",
             user.id,
             movie_id,
-            get_movie_title(movie),
+            movie_title(movie),
         )
 
-        message = (
-            "⭐ تمت إضافة الفيلم للمفضلة."
+        await query.message.reply_text(
+            "⭐ تمت الإضافة للمفضلة."
             if added
-            else "🗑 تم حذف الفيلم من المفضلة."
+            else "🗑 تم الحذف من المفضلة."
         )
-
-        await query.message.reply_text(message)
-
         return
 
-    # إضافة أو إزالة من قائمة المتابعة
+    # Watchlist toggle
     if data.startswith("watch:"):
 
         movie_id = int(data.split(":")[1])
-
         movie = await get_movie_details(movie_id)
 
         if not movie:
@@ -898,27 +973,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        added = db.toggle_watchlist(
+        added = db.toggle_item(
+            "watchlist",
             user.id,
             movie_id,
-            get_movie_title(movie),
+            movie_title(movie),
         )
 
-        message = (
-            "🔔 تمت إضافة الفيلم لقائمة المتابعة."
+        await query.message.reply_text(
+            "🔔 تمت الإضافة لقائمة المتابعة."
             if added
-            else "🗑 تم حذف الفيلم من قائمة المتابعة."
+            else "🗑 تم الحذف من قائمة المتابعة."
         )
-
-        await query.message.reply_text(message)
-
         return
 
-    # تفاصيل الفيلم
+    # Movie details
     if data.startswith("movie:"):
 
         movie_id = int(data.split(":")[1])
-
         movie = await get_movie_details(movie_id)
 
         if not movie:
@@ -927,15 +999,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        torrents = movie.get("torrents") or []
-
         buttons = []
 
-        for torrent in torrents:
+        for torrent in (movie.get("torrents") or [])[:8]:
 
             quality = torrent.get("quality", "Unknown")
             torrent_url = torrent.get("url")
-            magnet = get_magnet(movie, torrent)
+            magnet = magnet_link(movie, torrent)
 
             row = []
 
@@ -960,7 +1030,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons.append([
             InlineKeyboardButton(
-                "⭐ إضافة للمفضلة",
+                "⭐ المفضلة",
                 callback_data=f"fav:{movie_id}",
             ),
             InlineKeyboardButton(
@@ -969,42 +1039,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         ])
 
-        poster = movie.get("large_cover_image") or movie.get("medium_cover_image")
-
         caption = movie_caption(movie)
-
-        keyboard = InlineKeyboardMarkup(buttons)
+        poster = (
+            movie.get("large_cover_image")
+            or movie.get("medium_cover_image")
+        )
 
         if poster:
             try:
                 await query.message.reply_photo(
                     photo=poster,
-                    caption=caption[:1024],
+                    caption=caption,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
+                    reply_markup=InlineKeyboardMarkup(buttons),
                 )
                 return
             except Exception:
-                logger.exception("Failed to send detail poster")
+                logger.exception("Failed to send movie details poster")
 
         await query.message.reply_text(
-            caption[:4000],
+            caption,
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
-
         return
 
-    # إرسال رابط Magnet كنص قابل للنسخ
+    # Magnet link
     if data.startswith("magnet:"):
 
-        _, movie_id, quality = data.split(":", 2)
+        try:
+            _, movie_id, quality = data.split(":", 2)
+        except ValueError:
+            return
 
         movie = await get_movie_details(int(movie_id))
 
         if not movie:
             await query.message.reply_text(
-                "❌ الفيلم غير متاح حاليًا."
+                "❌ الفيلم غير متاح."
             )
             return
 
@@ -1018,11 +1090,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not torrent:
             await query.message.reply_text(
-                "❌ رابط Magnet غير متاح للجودة دي."
+                "❌ الجودة دي غير متاحة."
             )
             return
 
-        magnet = get_magnet(movie, torrent)
+        magnet = magnet_link(movie, torrent)
 
         if not magnet:
             await query.message.reply_text(
@@ -1032,45 +1104,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(
             "🧲 <b>رابط Magnet:</b>\n\n"
-            f"<code>{html.escape(magnet)}</code>\n\n"
-            "انسخ الرابط وافتحه في برنامج Torrent.",
+            f"<code>{safe(magnet)}</code>",
             parse_mode=ParseMode.HTML,
         )
-
         return
 
 
-# =========================================================
+# =====================================================
 # NEW MOVIES NOTIFICATIONS
-# =========================================================
+# =====================================================
 
-async def check_new_movies(context: ContextTypes.DEFAULT_TYPE):
+async def check_new_movies(context):
 
     try:
         movies = await get_movies(
             page=1,
             sort_by="date_added",
+            limit=50,
         )
 
-        if not movies:
+        if movies is None:
+            logger.error("Notification check failed: API unavailable")
             return
 
         current_ids = [
-            movie.get("id")
+            movie["id"]
             for movie in movies
             if movie.get("id")
         ]
 
         old_value = db.get_setting("last_movie_ids")
 
-        # أول تشغيل: حفظ القائمة الحالية بدون إرسال إشعارات قديمة
+        # أول تشغيل: حفظ الأفلام الحالية بدون إرسال تنبيهات قديمة
         if not old_value:
-
             db.set_setting(
                 "last_movie_ids",
                 json.dumps(current_ids),
             )
-
             logger.info("Notification baseline initialized")
             return
 
@@ -1090,28 +1160,25 @@ async def check_new_movies(context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not new_movies:
+            logger.info("No new movies")
             return
 
         users = db.get_all_users()
 
         logger.info(
-            "Found %s new movies for %s users",
+            "New movies: %s | Users: %s",
             len(new_movies),
             len(users),
         )
 
         for movie in new_movies:
 
-            title = safe_text(get_movie_title(movie))
-
             message = (
                 "🆕 <b>فيلم جديد على YTS!</b>\n\n"
-                f"🎬 {title}\n"
+                f"🎬 {safe(movie_title(movie))}\n"
                 f"📅 السنة: {movie.get('year', 'N/A')}\n"
                 f"⭐ التقييم: {movie.get('rating', 'N/A')}/10"
             )
-
-            keyboard = movie_keyboard(movie)
 
             for user_id in users:
 
@@ -1120,41 +1187,40 @@ async def check_new_movies(context: ContextTypes.DEFAULT_TYPE):
                         chat_id=int(user_id),
                         text=message,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=keyboard,
+                        reply_markup=movie_keyboard(movie),
                     )
 
-                except Exception as error:
-                    logger.warning(
-                        "Could not notify user %s: %s",
+                except Exception:
+                    logger.exception(
+                        "Could not notify user %s",
                         user_id,
-                        error,
                     )
 
     except Exception:
-        logger.exception("Notification job failed")
+        logger.exception("Notification task failed")
 
 
-# =========================================================
+# =====================================================
 # ERROR HANDLER
-# =========================================================
+# =====================================================
 
 async def error_handler(update, context):
 
     logger.error(
-        "Exception while handling update:",
+        "Unhandled error:",
         exc_info=context.error,
     )
 
 
-# =========================================================
-# MAIN APPLICATION
-# =========================================================
+# =====================================================
+# MAIN
+# =====================================================
 
 def main():
 
     if not BOT_TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing. Add it to environment variables."
+            "TELEGRAM_BOT_TOKEN is missing in GitHub Secrets."
         )
 
     application = (
@@ -1169,16 +1235,17 @@ def main():
     application.add_handler(CommandHandler("latest", latest_command))
     application.add_handler(CommandHandler("top", top_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("testapi", testapi_command))
     application.add_handler(CommandHandler("favorites", favorites_command))
     application.add_handler(CommandHandler("watchlist", watchlist_command))
     application.add_handler(CommandHandler("categories", categories_command))
 
-    # Callbacks
+    # Buttons
     application.add_handler(
         CallbackQueryHandler(callback_handler)
     )
 
-    # Text search
+    # Search
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1186,20 +1253,20 @@ def main():
         )
     )
 
-    # Errors
+    # Error handling
     application.add_error_handler(error_handler)
 
-    # Notifications
+    # Periodic notifications
     if application.job_queue:
         application.job_queue.run_repeating(
             check_new_movies,
             interval=CHECK_INTERVAL,
-            first=15,
+            first=20,
             name="new-movies-check",
         )
     else:
-        logger.warning(
-            "JobQueue is unavailable. Install python-telegram-bot[job-queue]."
+        logger.error(
+            "JobQueue unavailable. Install python-telegram-bot[job-queue]."
         )
 
     logger.info("YTS Movies Pro Ultra is starting...")
