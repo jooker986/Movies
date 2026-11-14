@@ -1,23 +1,14 @@
-
 YTS Movies Pro Telegram Bot (yts.gg/api/v2)
 ===========================================
 A high-performance, asynchronous Telegram bot powered by the YTS API (v2)
 with fallback mirror support, rich inline keyboards, Magnet & .torrent links,
 poster previews, IMDb ratings, and automated new-release alerts.
 
-Features:
-1. Instant Movie Search: Type any movie name (or IMDb ID like tt0133093) to get results.
-2. Full Quality & Codec Breakdown: 720p, 1080p, 2160p (4K), 3D, BluRay/WEB, file sizes, seeds/peers.
-3. One-Tap Magnet & Direct .torrent Links: Generates valid magnet URIs with top trackers + direct torrent download buttons.
-4. Browse Categories: Latest Movies, Top Rated (IMDb), Most Downloaded, and Genre Filters.
-5. Watchlist & Auto-Alerts: Save upcoming/wanted movies and get notified automatically when a high-quality rip drops.
-6. GitHub Actions Ready: Supports both 24/7 interactive polling mode and stateless GitHub Actions cron checks.
-
-Installation:
-    pip install -r requirements.txt
+Designed to run continuously on GitHub Actions or any Python environment.
 """
 
 import os
+import time
 import json
 import asyncio
 import logging
@@ -30,12 +21,15 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    InlineQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -46,17 +40,18 @@ from telegram.ext import (
 # ==============================================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-WATCHED_MOVIES_ENV = os.getenv("WATCHED_MOVIES", "")  # Comma-separated movie titles/IMDb IDs
-RUN_ONCE_MODE = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+WATCHED_MOVIES_ENV = os.getenv("WATCHED_MOVIES", "")
+IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 
-# Primary YTS API endpoint with automatic failover mirrors
+# Run for ~5 hours 45 minutes per GitHub Actions job before clean exit & auto-restart
+GITHUB_SESSION_MAX_SECONDS = int(os.getenv("GITHUB_SESSION_SECONDS", "20700"))
+
 YTS_API_MIRRORS = [
     "https://yts.gg/api/v2",
     "https://yts.mx/api/v2",
     "https://yts.lt/api/v2",
 ]
 
-# Standard high-speed BitTorrent trackers for Magnet URI generation
 TRACKERS = [
     "udp://open.demonii.com:1337/announce",
     "udp://tracker.openbittorrent.com:80",
@@ -87,12 +82,11 @@ class YTSClient:
     def __init__(self, mirrors: List[str]):
         self.mirrors = mirrors
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) YTSProBot/2.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) YTSProBot/2.1",
             "Accept": "application/json",
         }
 
     async def _request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """Tries each YTS mirror in order until a valid JSON response is received."""
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
             for base_url in self.mirrors:
@@ -118,7 +112,6 @@ class YTSClient:
         limit: int = 10,
         page: int = 1,
     ) -> List[Dict[str, Any]]:
-        """Searches or lists movies from YTS API."""
         params: Dict[str, Any] = {
             "limit": limit,
             "page": page,
@@ -137,20 +130,56 @@ class YTSClient:
             return []
         return data.get("movies", []) or []
 
+    async def smart_search(self, raw_query: str, limit: int = 12) -> List[Dict[str, Any]]:
+        """Multi-pass intelligent search across seeds & download counts with year/symbol cleanup."""
+        cleaned = " ".join(raw_query.strip().split())
+        if not cleaned:
+            return []
+
+        results_seeds, results_popular = await asyncio.gather(
+            self.list_movies(query_term=cleaned, sort_by="seeds", limit=limit),
+            self.list_movies(query_term=cleaned, sort_by="download_count", limit=limit),
+        )
+
+        combined: Dict[int, Dict[str, Any]] = {}
+        for m in results_seeds + results_popular:
+            m_id = m.get("id")
+            if m_id and m_id not in combined:
+                combined[m_id] = m
+
+        if len(combined) < 3:
+            simplified = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in cleaned)
+            tokens = [t for t in simplified.split() if not (len(t) == 4 and t.isdigit())]
+            fallback_query = " ".join(tokens)
+            if fallback_query and fallback_query.lower() != cleaned.lower():
+                fallback_movies = await self.list_movies(query_term=fallback_query, sort_by="seeds", limit=limit)
+                for m in fallback_movies:
+                    m_id = m.get("id")
+                    if m_id and m_id not in combined:
+                        combined[m_id] = m
+
+        q_lower = cleaned.lower()
+        ranked = sorted(
+            combined.values(),
+            key=lambda m: (
+                0 if (m.get("title", "").lower() == q_lower or m.get("imdb_code", "").lower() == q_lower)
+                else 1 if m.get("title", "").lower().startswith(q_lower)
+                else 2,
+                -(m.get("rating") or 0),
+            ),
+        )
+        return ranked[:limit]
+
     async def get_movie_details(self, movie_id: int) -> Optional[Dict[str, Any]]:
-        """Fetches full metadata, cast, and torrent qualities for a specific movie ID."""
-        params = {
-            "movie_id": movie_id,
-            "with_images": "true",
-            "with_cast": "true",
-        }
-        data = await self._request("movie_details.json", params=params)
+        data = await self._request(
+            "movie_details.json",
+            params={"movie_id": movie_id, "with_images": "true", "with_cast": "true"},
+        )
         if not data:
             return None
         return data.get("movie")
 
     async def get_suggestions(self, movie_id: int) -> List[Dict[str, Any]]:
-        """Fetches 4 similar movie recommendations."""
         data = await self._request("movie_suggestions.json", params={"movie_id": movie_id})
         if not data:
             return []
@@ -158,7 +187,6 @@ class YTSClient:
 
     @staticmethod
     def build_magnet_link(torrent_hash: str, movie_title: str) -> str:
-        """Constructs a standard BitTorrent magnet URI with trackers."""
         encoded_name = quote(movie_title)
         tracker_params = "".join(f"&tr={quote(tr)}" for tr in TRACKERS)
         return f"magnet:?xt=urn:btih:{torrent_hash}&dn={encoded_name}{tracker_params}"
@@ -168,7 +196,7 @@ yts = YTSClient(YTS_API_MIRRORS)
 
 
 # ==============================================================================
-# LOCAL PERSISTENCE HELPERS (WATCHLIST & NOTIFICATION STATE)
+# LOCAL PERSISTENCE HELPERS
 # ==============================================================================
 def load_json_file(path: str, default: Any) -> Any:
     if os.path.exists(path):
@@ -189,7 +217,6 @@ def save_json_file(path: str, data: Any) -> None:
 # UI FORMATTERS & KEYBOARD BUILDERS
 # ==============================================================================
 def format_movie_card(movie: Dict[str, Any]) -> str:
-    """Formats rich movie details in clean Markdown."""
     title = movie.get("title_long") or f"{movie.get('title')} ({movie.get('year')})"
     rating = movie.get("rating", "N/A")
     runtime = movie.get("runtime", 0)
@@ -227,13 +254,11 @@ def format_movie_card(movie: Dict[str, Any]) -> str:
 
 
 def build_movie_keyboard(movie: Dict[str, Any]) -> InlineKeyboardMarkup:
-    """Builds interactive download, magnet, trailer, and similar-movies buttons."""
     movie_id = movie.get("id")
     title = movie.get("title_long") or movie.get("title", "Movie")
     torrents = movie.get("torrents", []) or []
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Direct .torrent download buttons + Magnet trigger buttons per quality
     for idx, t in enumerate(torrents):
         q = t.get("quality", "HD")
         t_type = t.get("type", "").upper()
@@ -255,7 +280,6 @@ def build_movie_keyboard(movie: Dict[str, Any]) -> InlineKeyboardMarkup:
         )
         rows.append(row)
 
-    # Extra action row: YouTube Trailer, Similar Movies, Watchlist
     extra_row = []
     yt_code = movie.get("yt_trailer_code")
     if yt_code:
@@ -276,7 +300,6 @@ def build_movie_keyboard(movie: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Builds the main navigation keyboard."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🆕 أحدث الأفلام", callback_data="browse:date_added:1"),
@@ -298,7 +321,7 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_text = (
         "🎬 **أهلاً بك في بوت YTS Movies Pro!** 🍿\n\n"
-        "البوت متصل مباشرة بواجهة **YTS API** لجلب أحدث الأفلام بأعلى جودة وأقل حجم.\n\n"
+        "البوت شغال مباشرة ومتصل بـ **YTS API** لجلب أحدث الأفلام بأعلى جودة.\n\n"
         "🔎 **ابحث فوراً:** ابعت اسم أي فيلم (بالإنجليزي) أو كود IMDb مثل `tt0133093`.\n"
         "⚡ **روابط مباشرة:** يدعم ملفات `.torrent` المباشرة وروابط `Magnet` لكل الجودات (720p / 1080p / 4K).\n"
         "🔔 **تنبيهات تلقائية:** ضيف أي فيلم منتظره في قائمة المتابعة وهنبعتلك إشعار أول ما ينزل!"
@@ -317,7 +340,6 @@ async def send_movies_list(
     back_callback: str = "menu:home",
     pagination_row: Optional[List[InlineKeyboardButton]] = None,
 ) -> None:
-    """Renders a clean list of movies as clickable inline buttons."""
     if not movies:
         await target_message.reply_text(
             "❌ لم يتم العثور على نتائج مطابقة. جرب كتابة اسم الفيلم بالإنجليزية بشكل صحيح.",
@@ -347,24 +369,56 @@ async def send_movies_list(
 
 
 async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles any text sent by the user as a live search query on YTS."""
     query = (update.message.text or "").strip()
     if not query:
         return
 
-    wait_msg = await update.message.reply_text(f"🔎 جاري البحث في YTS عن: **{query}** ...", parse_mode=ParseMode.MARKDOWN)
-    movies = await yts.list_movies(query_term=query, sort_by="download_count", limit=10)
+    wait_msg = await update.message.reply_text(
+        f"🔎 جاري البحث الشامل في YTS عن: **{query}** ...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    movies = await yts.smart_search(query, limit=12)
     await wait_msg.delete()
 
     await send_movies_list(
         update.message,
         movies,
-        header=f"🎬 **نتائج البحث عن:** `{query}`\nاختر الفيلم لعرض التفاصيل وروابط التحميل:",
+        header=f"🎬 **نتائج البحث عن:** `{query}` ({len(movies)} فيلم)\nاختر الفيلم لعرض البوستر وروابط التحميل المباشرة:",
     )
 
 
+async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = (update.inline_query.query or "").strip()
+    if len(query) < 2:
+        return
+
+    movies = await yts.smart_search(query, limit=10)
+    results = []
+    for m in movies:
+        m_id = m.get("id")
+        title = m.get("title_long") or f"{m.get('title')} ({m.get('year')})"
+        rating = m.get("rating", "N/A")
+        qualities = " / ".join(sorted({t.get("quality", "") for t in (m.get("torrents") or [])}))
+        thumb = m.get("small_cover_image") or m.get("medium_cover_image")
+
+        results.append(
+            InlineQueryResultArticle(
+                id=str(m_id),
+                title=f"🎬 {title}",
+                description=f"⭐ IMDb: {rating}/10 | الجودات: {qualities}",
+                thumbnail_url=thumb,
+                input_message_content=InputTextMessageContent(
+                    message_text=format_movie_card(m),
+                    parse_mode=ParseMode.MARKDOWN,
+                ),
+                reply_markup=build_movie_keyboard(m),
+            )
+        )
+
+    await update.inline_query.answer(results, cache_time=60)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Routes all inline button callbacks."""
     query = update.callback_query
     await query.answer()
     data = query.data or ""
@@ -372,13 +426,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "menu:home":
         await query.message.reply_text(
-            "🏠 **القائمة الرئيسية — YTS Movies Pro**\nاختر القسم أو اكتب اسم أي فيلم للبحث:",
+            "🏠 **القائمة الرئيسية — YTS Movies Pro**\nاختر قسماً للتصفح أو اكتب اسم أي فيلم للبحث الفوري:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=build_main_menu_keyboard(),
         )
 
     elif data == "menu:genres":
-        genres = ["Action", "Adventure", "Animation", "Comedy", "Crime", "Drama", "Horror", "Sci-Fi", "Thriller", "Mystery"]
+        genres = [
+            "Action", "Adventure", "Animation", "Comedy",
+            "Crime", "Documentary", "Drama", "Fantasy",
+            "Horror", "Mystery", "Romance", "Sci-Fi",
+            "Thriller", "War",
+        ]
         rows = []
         for i in range(0, len(genres), 2):
             row = [InlineKeyboardButton(f"🎭 {genres[i]}", callback_data=f"genre:{genres[i]}:1")]
@@ -387,7 +446,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             rows.append(row)
         rows.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:home")])
         await query.message.reply_text(
-            "🎭 **اختر تصنيف الأفلام المفضل لديك:**",
+            "🎭 **اختر تصنيف الأفلام المفضل:**",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(rows),
         )
@@ -500,7 +559,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
-            await query.message.reply_text(f"ℹ️ فيلم **{movie_title}** موجود بالفعل في قائمة متابعتك.", parse_mode=ParseMode.MARKDOWN)
+            await query.message.reply_text(
+                f"ℹ️ فيلم **{movie_title}** موجود بالفعل في قائمة متابعتك.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
     elif data == "menu:watchlist":
         watchlists = load_json_file(WATCHLIST_FILE, {})
@@ -533,18 +595,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             removed = user_list.pop(idx)
             watchlists[user_id] = user_list
             save_json_file(WATCHLIST_FILE, watchlists)
-            await query.message.reply_text(f"🗑️ تم حذف **{removed}** من قائمة المتابعة.", parse_mode=ParseMode.MARKDOWN)
+            await query.message.reply_text(
+                f"🗑️ تم حذف **{removed}** من قائمة المتابعة.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
 
 # ==============================================================================
-# BACKGROUND MONITOR (INTERACTIVE JOBQUEUE + GITHUB ACTIONS CRON)
+# BACKGROUND MONITOR
 # ==============================================================================
 async def check_new_releases_and_notify(bot: Bot) -> None:
-    """Checks YTS for watched movies or top new releases and sends Telegram alerts."""
     state: Dict[str, bool] = load_json_file(STATE_FILE, {})
     state_changed = False
 
-    # 1. Check GitHub Secrets watched list (if configured)
     env_targets = [t.strip() for t in WATCHED_MOVIES_ENV.split(",") if t.strip()]
     if ADMIN_CHAT_ID and env_targets:
         for target in env_targets:
@@ -563,7 +626,6 @@ async def check_new_releases_and_notify(bot: Bot) -> None:
                     state[key] = True
                     state_changed = True
 
-    # 2. Check interactive users' watchlists
     watchlists: Dict[str, List[str]] = load_json_file(WATCHLIST_FILE, {})
     for uid, titles in watchlists.items():
         for title in titles:
@@ -572,7 +634,7 @@ async def check_new_releases_and_notify(bot: Bot) -> None:
                 qualities = [t.get("quality", "") for t in (m.get("torrents") or [])]
                 key = f"{uid}::{m.get('id')}::{','.join(sorted(qualities))}"
                 if not state.get(key):
-                    caption = f"🔔 **تحديث جديد لفيلم في قائمة متابعتك:**\n\n" + format_movie_card(m)
+                    caption = "🔔 **تحديث جديد لفيلم في قائمة متابعتك:**\n\n" + format_movie_card(m)
                     try:
                         await bot.send_message(
                             chat_id=int(uid),
@@ -593,24 +655,49 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await check_new_releases_and_notify(context.bot)
 
 
+async def run_github_actions_runner() -> None:
+    """
+    Runs the full interactive Telegram bot inside GitHub Actions for up to
+    ~5h45m per workflow run, then gracefully shuts down so the next scheduled
+    run picks up seamlessly without losing messages.
+    """
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(InlineQueryHandler(handle_inline_query))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_search))
+    application.job_queue.run_repeating(scheduled_job, interval=600, first=15)
+
+    logger.info("Starting YTS Movies Pro Bot inside GitHub Actions runner...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+
+    start_time = time.monotonic()
+    try:
+        while (time.monotonic() - start_time) < GITHUB_SESSION_MAX_SECONDS:
+            await asyncio.sleep(30)
+    finally:
+        logger.info("Gracefully stopping GitHub Actions bot session before timeout...")
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
+
 def main() -> None:
-    if RUN_ONCE_MODE:
-        if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-            logger.error("Missing TELEGRAM_BOT_TOKEN!")
-            return
-        asyncio.run(check_new_releases_and_notify(Bot(token=BOT_TOKEN)))
+    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE" or not BOT_TOKEN:
+        print("❌ ERROR: Please set TELEGRAM_BOT_TOKEN before running.")
         return
 
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("❌ ERROR: Please set TELEGRAM_BOT_TOKEN before running.")
+    if IS_GITHUB_ACTIONS:
+        asyncio.run(run_github_actions_runner())
         return
 
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(InlineQueryHandler(handle_inline_query))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_search))
-
-    # Run background check every 10 minutes
     application.job_queue.run_repeating(scheduled_job, interval=600, first=20)
 
     logger.info("YTS Movies Pro Telegram Bot is running...")
