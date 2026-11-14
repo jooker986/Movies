@@ -1,0 +1,25 @@
+name: YTS Movies Pro Bot
+​on:
+push:
+branches: [ main ]
+schedule:
+- cron: "0 */6 * * *"
+workflow_dispatch:
+​concurrency:
+group: yts-telegram-bot-runner
+cancel-in-progress: true
+​jobs:
+run-yts-bot:
+runs-on: ubuntu-latest
+timeout-minutes: 355
+steps:
+- uses: actions/checkout@v4
+- uses: actions/setup-python@v5
+with:
+python-version: "3.11"
+- run: pip install "python-telegram-bot[job-queue]>=21.0" "aiohttp>=3.9.0"
+- run: python Movies.py
+env:
+TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+WATCHED_MOVIES: ${{ secrets.WATCHED_MOVIES }}
