@@ -1,12 +1,16 @@
-name: YTS Movies Pro Auto-Monitor
+name: YTS Movies Pro Bot (24/7 GitHub Runner)
 ​on:
 schedule:
-# يفحص الموقع تلقائياً كل 15 دقيقة
-- cron: "*/15 * * * *"
-workflow_dispatch: # للتشغيل اليدوي الفوري في أي وقت
+# يعيد التشغيل تلقائياً كل 6 ساعات لضمان استمرار عمل البوت 24/7 على GitHub
+- cron: "0 */6 * * *"
+workflow_dispatch: # للتشغيل اليدوي الفوري بضغطة زر
+​concurrency:
+group: yts-telegram-bot-runner
+cancel-in-progress: false
 ​jobs:
-monitor-yts:
+run-yts-bot:
 runs-on: ubuntu-latest
+timeout-minutes: 355
 ​steps:
 - name: Checkout repository
 uses: actions/checkout@v4
@@ -14,18 +18,20 @@ uses: actions/checkout@v4
 uses: actions/setup-python@v5
 with:
 python-version: "3.11"
-​- name: Restore YTS notification state cache
+​- name: Restore YTS bot state & watchlists
 uses: actions/cache@v4
 with:
-path: yts_notified_state.json
-key: yts-notified-state-${{ github.run_id }}
+path: |
+yts_notified_state.json
+yts_user_watchlists.json
+key: yts-bot-state-${{ github.run_id }}
 restore-keys: |
-yts-notified-state-
+yts-bot-state-
 ​- name: Install dependencies
 run: |
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-​- name: Run YTS Movies Monitor
+​- name: Run YTS Movies Pro Telegram Bot
 env:
 TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
