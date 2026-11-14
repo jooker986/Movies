@@ -2,53 +2,47 @@
 name: YTS Movies Pro Ultra
 
 on:
-  push:
-    branches:
-      - main
-
+  workflow_dispatch:
   schedule:
     - cron: "0 */6 * * *"
 
-  workflow_dispatch:
-
 concurrency:
-  group: yts-ultra-runner
-  cancel-in-progress: false
+  group: yts-telegram-bot
+  cancel-in-progress: true
 
 jobs:
-  run-yts-bot:
+  run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 355
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
-      - name: Restore Database
+      - name: Restore database
         uses: actions/cache@v4
         with:
-          path: data/
-          key: yts-ultra-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            yts_movies.db
+            yts_movies.db-shm
+            yts_movies.db-wal
+          key: ${{ runner.os }}-yts-db-${{ github.run_id }}
           restore-keys: |
-            yts-ultra-${{ runner.os }}-
+            ${{ runner.os }}-yts-db-
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "python-telegram-bot[job-queue]==21.10" aiohttp
+          pip install "python-telegram-bot[job-queue]>=21,<23" aiohttp
 
-      - name: Start Bot
+      - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          WATCHED_MOVIES: ${{ vars.WATCHED_MOVIES }}
-          GITHUB_ACTIONS: "true"
-          GITHUB_SESSION_SECONDS: "20700"
-          CHECK_INTERVAL: "600"
-        run: python bot.py
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          DB_PATH: yts_movies.db
+        run: python -u bot.py
